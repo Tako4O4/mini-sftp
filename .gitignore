@@ -3,6 +3,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Local application data
+/data/
+
 # Development TLS certificates and private keys
 /certs/
 
