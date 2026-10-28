@@ -1,28 +1,43 @@
 import socket
 
+from shared.protocol import receive_message, send_message
+
 HOST = "127.0.0.1"
 PORT = 5000
 
 
-def main():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-        server.bind((HOST, PORT))
-        server.listen()
+def handle_command(message: dict) -> dict:
+    """Process the received command and return a response."""
+    command = message.get("command")
 
-        print(f"Server listening on {HOST}:{PORT}")
+    if command == "PING":
+        return {"status": "OK", "response": "PONG"}
 
-        connection, address = server.accept()
+    return {"status": "ERROR", "response": f"Unknown command: {command}"}
 
-        with connection:
-            print(f"Client connected: {address}")
 
-            data = connection.recv(1024)
-            message = data.decode("utf-8")
+def handle_client(connection: socket.socket) -> None:
+    """Handle one client request."""
+    request = receive_message(connection)
+    print(f"Received request: {request}")
 
-            print(f"Received message: {message}")
+    response = handle_command(request)
+    send_message(connection, response)
 
-            response = "Hello from server!"
-            connection.sendall(response.encode("utf-8"))
+
+def main() -> None:
+    with socket.create_server((HOST, PORT)) as server:
+        print(f"Server listening on {HOST}:{PORT}", flush=True)
+
+        while True:
+            connection, address = server.accept()
+            print(f"Client connected from {address}", flush=True)
+
+            with connection:
+                try:
+                    handle_client(connection)
+                except (ConnectionError, OSError, ValueError) as error:
+                    print(f"Error handling client: {error}", flush=True)
 
 
 if __name__ == "__main__":
