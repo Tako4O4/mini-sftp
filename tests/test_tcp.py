@@ -1,66 +1,37 @@
 import socket
-import subprocess
-import sys
-import time
+from threading import Thread
+
+from server.main import handle_client
+from shared.protocol import receive_message, send_message
 
 
 def test_tcp_communication():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
+    with socket.create_server(("127.0.0.1", 0)) as server:
+        server.settimeout(3)
+        port = server.getsockname()[1]
+        errors = []
 
-    server_code = """
-import socket
-import sys
-
-from server.main import HOST
-
-port = int(sys.argv[1])
-
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-    server.bind((HOST, port))
-    server.listen()
-
-    connection, _ = server.accept()
-
-    with connection:
-        connection.settimeout(3)
-        data = connection.recv(1024)
-        
-        connection.sendall(b"Hello from server!")
-"""
-
-    server = subprocess.Popen(
-        [sys.executable, "-c", server_code, str(port)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-
-    try:
-        deadline = time.monotonic() + 3
-
-        while True:
+        def serve_one_client():
             try:
-                client = socket.create_connection(
-                    ("127.0.0.1", port),
-                    timeout=1,
-                )
-                break
-            except ConnectionRefusedError as exception:
-                if server.poll() is not None:
-                    raise RuntimeError(
-                        "Server exited before accepting connections"
-                    ) from exception
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        "Server did not start within 3 seconds"
-                    ) from exception
-                time.sleep(0.05)
+                connection, _ = server.accept()
+                with connection:
+                    connection.settimeout(3)
+                    handle_client(connection)
+            except OSError as error:
+                errors.append(error)
 
-        with client:
-            client.settimeout(3)
-            client.sendall(b"Hello from client!")
+        thread = Thread(target=serve_one_client)
+        thread.start()
 
-    finally:
-        server.kill()
-        server.communicate()  # Wait for the server process to terminate
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+                client.settimeout(3)
+                send_message(client, {"command": "PING"})
+                response = receive_message(client)
+
+            assert response == {"status": "OK", "response": "PONG"}
+        finally:
+            thread.join(timeout=5)
+
+        assert not thread.is_alive(), "Server thread did not finish"
+        assert not errors, f"Server errors: {errors}"

@@ -1,18 +1,20 @@
 import socket
 
+from shared.protocol import receive_message, send_message
+
 HOST = "127.0.0.1"
 PORT = 5000
 
 
-def main():
-    with socket.create_connection((HOST, PORT)) as client:
+def main() -> None:
+    with socket.create_connection((HOST, PORT), timeout=5) as client:
         print(f"Connected to server at {HOST}:{PORT}")
 
-        message = "Hello from client!"
-        client.sendall(message.encode("utf-8"))
+        request = {"command": "PING"}
+        send_message(client, request)
 
-        response = client.recv(1024)
-        print(f"Received response: {response.decode('utf-8')}")
+        response = receive_message(client)
+        print(f"Received response: {response}")
 
 
 if __name__ == "__main__":
