@@ -1,6 +1,8 @@
 import socket
+import ssl
 
 from shared.protocol import receive_message, send_message
+from shared.tls import create_server_context
 
 HOST = "127.0.0.1"
 PORT = 5000
@@ -26,17 +28,28 @@ def handle_client(connection: socket.socket) -> None:
 
 
 def main() -> None:
+    tls_context = create_server_context()
+
     with socket.create_server((HOST, PORT)) as server:
-        print(f"Server listening on {HOST}:{PORT}", flush=True)
+        print(f"Secure server listening on {HOST}:{PORT}", flush=True)
 
         while True:
             connection, address = server.accept()
             print(f"Client connected from {address}", flush=True)
 
             with connection:
+                connection.settimeout(3)
+
                 try:
-                    handle_client(connection)
-                except (ConnectionError, OSError, ValueError) as error:
+                    with tls_context.wrap_socket(
+                        connection,
+                        server_side=True,
+                    ) as secure_connection:
+                        print(
+                            f"TLS connection established: {secure_connection.version()}"
+                        )
+                        handle_client(secure_connection)
+                except (ssl.SSLError, ConnectionError, OSError, ValueError) as error:
                     print(f"Error handling client: {error}", flush=True)
 
 

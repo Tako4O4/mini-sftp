@@ -3,6 +3,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Development TLS certificates and private keys
+/certs/
+
 # C extensions
 *.so
 
