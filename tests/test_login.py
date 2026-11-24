@@ -2,6 +2,7 @@ import socket
 from threading import Thread
 
 from client.main import Client, Terminal, run_terminal
+from server.auth import create_user
 from server.main import handle_client
 
 
@@ -117,3 +118,32 @@ def test_unknown_command_is_handled_locally(tmp_path):
         passwords=[],
     )
     assert "Unknown command: FLY. Type HELP for a list of commands." in output
+
+
+def test_list_in_terminal_shows_files(tmp_path):
+    db_path = tmp_path / "users.db"
+    create_user("Alice", "correct-password", db_path)
+    files_dir = db_path.parent / "files" / "Alice"
+    files_dir.mkdir(parents=True)
+    (files_dir / "notes.txt").write_bytes(b"hello")
+
+    _, _, output = _run_session(
+        db_path,
+        lines=["LOGIN", "Alice", "LIST", "EXIT"],
+        passwords=["correct-password"],
+    )
+
+    assert "           5  notes.txt" in output
+
+
+def test_list_in_terminal_when_empty(tmp_path):
+    db_path = tmp_path / "users.db"
+    create_user("Alice", "correct-password", db_path)
+
+    _, _, output = _run_session(
+        db_path,
+        lines=["LOGIN", "Alice", "LIST", "EXIT"],
+        passwords=["correct-password"],
+    )
+
+    assert "No files." in output

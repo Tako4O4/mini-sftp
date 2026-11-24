@@ -5,6 +5,15 @@ from threading import Thread
 
 from server.auth import DEFAULT_DB, create_user, verify_password
 from server.ratelimit import LoginLimiter
+from server.storage import (
+    describe_file,
+    find_user_file,
+    list_files,
+    receive_upload,
+    send_file_data,
+    user_files_dir,
+    validate_upload_request,
+)
 from shared.protocol import receive_message, send_message
 from shared.tls import create_server_context
 
@@ -95,6 +104,62 @@ def handle_logout(session: Session) -> dict:
     return {"status": "OK", "response": "Logged out"}
 
 
+def handle_list(session: Session, db_path) -> dict:
+    """List the logged-in user's files."""
+    directory = user_files_dir(db_path, session.username, create=True)
+    return list_files(directory)
+
+
+def handle_upload_header(message: dict) -> dict:
+    """Check an UPLOAD header. READY tells the client to send the file data."""
+    try:
+        validate_upload_request(message)
+    except ValueError as error:
+        return {"status": "ERROR", "response": str(error)}
+    return {"status": "READY", "response": "Send the file data"}
+
+
+def finish_upload(connection: socket.socket, session: Session, request, db_path):
+    """Receive the file data for an UPLOAD that was accepted with READY."""
+    name, size, digest = validate_upload_request(request)
+    directory = user_files_dir(db_path, session.username, create=True)
+    return receive_upload(connection, directory, name, size, digest)
+
+
+def handle_download_header(message: dict, session: Session, db_path) -> dict:
+    """Check a DOWNLOAD request and describe the file. READY means data follows."""
+    try:
+        path = find_user_file(
+            user_files_dir(db_path, session.username), message.get("name")
+        )
+    except FileNotFoundError:
+        return {"status": "ERROR", "response": "No such file"}
+    except ValueError as error:
+        return {"status": "ERROR", "response": str(error)}
+
+    size, digest = describe_file(path)
+    return {
+        "status": "READY",
+        "response": "Sending file data",
+        "size": size,
+        "sha256": digest,
+    }
+
+
+def finish_download(
+    connection: socket.socket, session: Session, request, db_path, header
+):
+    """Send the file data for a DOWNLOAD, then record the client's verdict."""
+    name = request["name"]
+    path = find_user_file(user_files_dir(db_path, session.username), name)
+    send_file_data(connection, path, header["size"])
+
+    verdict = receive_message(connection)  # Client's SHA-256 check result
+    if verdict.get("status") == "OK":
+        return {"status": "OK", "response": f"Downloaded '{name}'"}
+    return {"status": "ERROR", "response": "Client reported a failed download"}
+
+
 def handle_command(
     message: dict,
     session: Session | None = None,
@@ -122,6 +187,15 @@ def handle_command(
 
     if command == "LOGOUT":
         return handle_logout(session)
+
+    if command == "LIST":
+        return handle_list(session, db_path)
+
+    if command == "UPLOAD":
+        return handle_upload_header(message)
+
+    if command == "DOWNLOAD":
+        return handle_download_header(message, session, db_path)
 
     if command == "PING":
         return {"status": "OK", "response": "PONG"}
@@ -163,7 +237,8 @@ def log_name(value) -> str:
     return repr(value)
 
 
-KNOWN_COMMANDS = {"LOGIN", "LOGOUT", "PING", "REGISTER"}
+KNOWN_COMMANDS = {"DOWNLOAD", "LIST", "LOGIN", "LOGOUT", "PING", "REGISTER", "UPLOAD"}
+DATA_COMMANDS = ("UPLOAD", "DOWNLOAD")  # Commands followed by raw file data
 
 
 def command_for_log(request: dict) -> str:
@@ -175,9 +250,12 @@ def command_for_log(request: dict) -> str:
 
 
 def command_detail(request: dict) -> str:
-    """Extra log text naming the account a request is about, if any."""
-    if request.get("command") in ("LOGIN", "REGISTER"):
+    """Extra log text naming the account or file a request is about, if any."""
+    command = request.get("command")
+    if command in ("LOGIN", "REGISTER"):
         return f" for user {log_name(request.get('username'))}"
+    if command in DATA_COMMANDS:
+        return f" file {log_name(request.get('name'))}"
     return ""
 
 
@@ -192,7 +270,18 @@ def handle_client(connection: socket.socket, db_path=DEFAULT_DB, address=None) -
             except ConnectionError:
                 return  # Client closed the connection
 
+            command = request.get("command")
             response = handle_command(request, session, db_path)
+
+            if command in DATA_COMMANDS and response["status"] == "READY":
+                header = response
+                send_message(connection, header)  # Data frames follow this reply
+                if command == "UPLOAD":
+                    response = finish_upload(connection, session, request, db_path)
+                else:
+                    response = finish_download(
+                        connection, session, request, db_path, header
+                    )
 
             # Log only the command name and outcome: requests can contain passwords.
             print(
