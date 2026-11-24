@@ -80,3 +80,26 @@ def test_invalid_username(tmp_path):
 def test_short_password(tmp_path):
     with pytest.raises(ValueError, match="Password must contain"):
         create_user("Alice", "short", tmp_path / "users.db")
+
+
+def test_unknown_user_still_runs_password_hash(tmp_path, monkeypatch):
+    """An unknown user must cost the same scrypt work as a wrong password."""
+    from server import auth
+
+    db_path = tmp_path / "users.db"
+    create_user("Alice", "correct-password", db_path)
+
+    calls = []
+    real_hash = auth.hash_password
+
+    def recording_hash(password, salt):
+        calls.append(salt)
+        return real_hash(password, salt)
+
+    monkeypatch.setattr(auth, "hash_password", recording_hash)
+
+    assert not verify_password("nobody", "some-password", db_path)
+    assert len(calls) == 1
+
+    assert not verify_password("Alice", "wrong-password", db_path)
+    assert len(calls) == 2

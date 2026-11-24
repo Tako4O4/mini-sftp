@@ -13,6 +13,7 @@ USERNAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,31}")
 SCRYPT_N = 2**14
 SCRYPT_R = 8
 SCRYPT_P = 1
+DUMMY_SALT = bytes(16)  # Used only to spend time when the user does not exist
 
 
 def validate_password(password: str) -> None:
@@ -73,24 +74,23 @@ def create_user(username: str, password: str, db_path: Path = DEFAULT_DB) -> Non
 
 
 def verify_password(username: str, password: str, db_path: Path = DEFAULT_DB) -> bool:
-    if not USERNAME_PATTERN.fullmatch(username):
-        return False
-    if len(password.encode("utf-8")) > 1024:
-        return False
-
     initialize_database(db_path)
 
-    with sqlite3.connect(db_path) as db:
-        row = db.execute(
-            """
-            SELECT salt, password_hash
-            FROM users
-            WHERE username = ?
-            """,
-            (username,),
-        ).fetchone()
+    row = None
+    if USERNAME_PATTERN.fullmatch(username) and len(password.encode("utf-8")) <= 1024:
+        with sqlite3.connect(db_path) as db:
+            row = db.execute(
+                """
+                SELECT salt, password_hash
+                FROM users
+                WHERE username = ?
+                """,
+                (username,),
+            ).fetchone()
 
     if row is None:
+        # Hash anyway so an unknown user costs the same time as a wrong password.
+        hash_password(password, DUMMY_SALT)
         return False
 
     salt, stored_hash = row
