@@ -1,16 +1,127 @@
 import socket
 import ssl
+from dataclasses import dataclass
+from threading import Thread
 
+from server.auth import DEFAULT_DB, create_user, verify_password
+from server.ratelimit import LoginLimiter
 from shared.protocol import receive_message, send_message
 from shared.tls import create_server_context
 
 HOST = "127.0.0.1"
 PORT = 5000
+IDLE_TIMEOUT = 300  # Seconds a connection may sit idle before the server drops it
+
+# Commands that may run before login. Every other command needs a logged-in session.
+PUBLIC_COMMANDS = {"LOGIN", "PING", "REGISTER"}
+
+# Shared by all connections, so failures from every client are counted together.
+LOGIN_LIMITER = LoginLimiter()
 
 
-def handle_command(message: dict) -> dict:
+@dataclass
+class Session:
+    """State for one client connection."""
+
+    username: str | None = None
+    ip: str | None = None  # Client address, used for login rate limiting
+
+
+def handle_login(
+    message: dict, session: Session, db_path, limiter: LoginLimiter
+) -> dict:
+    """Check credentials and mark the session as logged in on success."""
+    username = message.get("username")
+    password = message.get("password")
+
+    if not isinstance(username, str) or not isinstance(password, str):
+        return {
+            "status": "ERROR",
+            "response": "LOGIN requires string username and password",
+        }
+
+    if session.username is not None:
+        return {
+            "status": "ERROR",
+            "response": f"Already logged in as {session.username}; LOGOUT first",
+        }
+
+    if limiter.is_blocked(username, session.ip):
+        return {
+            "status": "ERROR",
+            "response": "Too many failed login attempts. Try again later.",
+        }
+
+    if not verify_password(username, password, db_path):
+        limiter.record_failure(username, session.ip)
+        return {"status": "ERROR", "response": "Invalid username or password"}
+
+    limiter.record_success(username)
+    session.username = username
+    return {"status": "OK", "response": f"Logged in as {username}"}
+
+
+def handle_register(message: dict, session: Session, db_path) -> dict:
+    """Create a new account. Only allowed when not logged in."""
+    username = message.get("username")
+    password = message.get("password")
+
+    if not isinstance(username, str) or not isinstance(password, str):
+        return {
+            "status": "ERROR",
+            "response": "REGISTER requires string username and password",
+        }
+
+    if session.username is not None:
+        return {
+            "status": "ERROR",
+            "response": "Log out before creating an account",
+        }
+
+    try:
+        create_user(username, password, db_path)
+    except ValueError as error:
+        return {"status": "ERROR", "response": str(error)}
+
+    return {
+        "status": "OK",
+        "response": f"Account '{username}' created. You can now LOGIN.",
+    }
+
+
+def handle_logout(session: Session) -> dict:
+    """End the current login."""
+    session.username = None
+    return {"status": "OK", "response": "Logged out"}
+
+
+def handle_command(
+    message: dict,
+    session: Session | None = None,
+    db_path=DEFAULT_DB,
+    limiter: LoginLimiter | None = None,
+) -> dict:
     """Process the received command and return a response."""
+    if session is None:
+        session = Session()
+    if limiter is None:
+        limiter = LOGIN_LIMITER
+
     command = message.get("command")
+    if not isinstance(command, str):
+        return {"status": "ERROR", "response": "Command must be a string"}
+
+    if command not in PUBLIC_COMMANDS and session.username is None:
+        return {"status": "ERROR", "response": "Login required"}
+
+    if command == "LOGIN":
+        return handle_login(message, session, db_path, limiter)
+
+    if command == "REGISTER":
+        return handle_register(message, session, db_path)
+
+    if command == "LOGOUT":
+        return handle_logout(session)
 
     if command == "PING":
         return {"status": "OK", "response": "PONG"}
@@ -18,13 +129,116 @@ def handle_command(message: dict) -> dict:
     return {"status": "ERROR", "response": f"Unknown command: {command}"}
 
 
-def handle_client(connection: socket.socket) -> None:
-    """Handle one client request."""
-    request = receive_message(connection)
-    print(f"Received request: {request}")
+def format_endpoint(address) -> str:
+    """Render a client address as `ip:port`, bracketing IPv6 addresses."""
+    if not address:
+        return "unknown"
+    host, port = address[0], address[1]
+    if ":" in host:
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
 
-    response = handle_command(request)
-    send_message(connection, response)
+
+def source_label(address, session: Session) -> str:
+    """Name a client for log lines: its address, plus its username once logged in."""
+    endpoint = format_endpoint(address)
+    if session.username is None:
+        return endpoint
+    return f"{session.username} ({endpoint})"
+
+
+MAX_LOGGED_NAME = 64
+
+
+def log_name(value) -> str:
+    """Render an untrusted name safely for one log line.
+
+    repr() quotes the value and escapes control characters, so a name containing
+    a newline cannot forge extra log lines. The length is capped.
+    """
+    if not isinstance(value, str):
+        return "<invalid>"
+    if len(value) > MAX_LOGGED_NAME:
+        return repr(value[:MAX_LOGGED_NAME]) + "..."
+    return repr(value)
+
+
+KNOWN_COMMANDS = {"LOGIN", "LOGOUT", "PING", "REGISTER"}
+
+
+def command_for_log(request: dict) -> str:
+    """Command name for logging: known names as-is, anything else escaped."""
+    command = request.get("command")
+    if isinstance(command, str) and command in KNOWN_COMMANDS:
+        return command
+    return log_name(command)
+
+
+def command_detail(request: dict) -> str:
+    """Extra log text naming the account a request is about, if any."""
+    if request.get("command") in ("LOGIN", "REGISTER"):
+        return f" for user {log_name(request.get('username'))}"
+    return ""
+
+
+def handle_client(connection: socket.socket, db_path=DEFAULT_DB, address=None) -> None:
+    """Handle requests on one connection until the client closes it."""
+    session = Session(ip=address[0] if address else None)
+
+    try:
+        while True:
+            try:
+                request = receive_message(connection)
+            except ConnectionError:
+                return  # Client closed the connection
+
+            response = handle_command(request, session, db_path)
+
+            # Log only the command name and outcome: requests can contain passwords.
+            print(
+                f"Command {command_for_log(request)} from "
+                f"{source_label(address, session)}{command_detail(request)} "
+                f"-> {response.get('status')}",
+                flush=True,
+            )
+            send_message(connection, response)
+    finally:
+        print(f"Client {source_label(address, session)} disconnected", flush=True)
+
+
+def serve_connection(
+    connection: socket.socket, address, tls_context: ssl.SSLContext
+) -> None:
+    """Run the TLS handshake and session for one client. Runs in its own thread."""
+    with connection:
+        connection.settimeout(IDLE_TIMEOUT)
+
+        try:
+            with tls_context.wrap_socket(
+                connection,
+                server_side=True,
+            ) as secure_connection:
+                print(
+                    f"TLS connection from {address} established: "
+                    f"{secure_connection.version()}",
+                    flush=True,
+                )
+                handle_client(secure_connection, address=address)
+        except (ssl.SSLError, ConnectionError, OSError, ValueError) as error:
+            print(f"Error handling client {address}: {error}", flush=True)
+
+
+def serve(server: socket.socket, tls_context: ssl.SSLContext) -> None:
+    """Accept clients forever, serving each one in a separate thread."""
+    while True:
+        connection, address = server.accept()
+        print(f"Client connected from {address}", flush=True)
+
+        Thread(
+            target=serve_connection,
+            args=(connection, address, tls_context),
+            daemon=True,
+        ).start()
 
 
 def main() -> None:
@@ -32,25 +246,7 @@ def main() -> None:
 
     with socket.create_server((HOST, PORT)) as server:
         print(f"Secure server listening on {HOST}:{PORT}", flush=True)
-
-        while True:
-            connection, address = server.accept()
-            print(f"Client connected from {address}", flush=True)
-
-            with connection:
-                connection.settimeout(3)
-
-                try:
-                    with tls_context.wrap_socket(
-                        connection,
-                        server_side=True,
-                    ) as secure_connection:
-                        print(
-                            f"TLS connection established: {secure_connection.version()}"
-                        )
-                        handle_client(secure_connection)
-                except (ssl.SSLError, ConnectionError, OSError, ValueError) as error:
-                    print(f"Error handling client: {error}", flush=True)
+        serve(server, tls_context)
 
 
 if __name__ == "__main__":
